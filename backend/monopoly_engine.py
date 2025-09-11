@@ -1,5 +1,7 @@
 import random
 from collections import deque
+from enum import Enum
+from typing import List, Optional, Dict, Callable, Any
 
 # Doubly circular linked list implementation for the monopoly board, this allows for traversing back when going to jail & forth when moving normally
 # Implementations needed:
@@ -10,6 +12,24 @@ from collections import deque
 # - Add a method to display the current state of the board and players
 # - Add a method to handle special cards (when you owe money to another player(s))
 # - Add a cache to players for full sets (to speed up rent calculation)
+
+class GameState(Enum):
+    PLAYING = "playing"
+    WAITING_FOR_CHOICE = "waiting_for_choice"
+    WAITING_FOR_PAYMENT = "waiting_for_payment"
+    WAITING_FOR_PROPERTY_DECISION = "waiting_for_property_decision"
+    GAME_OVER = "game_over"
+
+class PendingAction:
+    """Represents an action that requires user input"""
+    def __init__(self, action_type: str, player: 'Player', description: str, 
+                 choices: List[str] = None, callback: Callable = None, data: Dict = None):
+        self.action_type = action_type
+        self.player = player
+        self.description = description
+        self.choices = choices or []
+        self.callback = callback
+        self.data = data or {}
 
 class Player:
     """ Represents a player in the game """
@@ -23,6 +43,8 @@ class Player:
         self.in_jail = False
         self.jail_free_card = False
         self.must_sell = False
+        self.must_pay_someone = False
+        self.is_bankrupt = False
 
     def __str__(self):
         return f"Player {self.name}, Money: {self.money}, Position: {self.position.data['Name'] if self.position else 'None'}"
@@ -48,6 +70,37 @@ class Card:
     
     def apply(self, game, player):
         return self.effect(game, player, **self.effect_params)
+
+def _pay_player_with_choice(game, player, amount: int):
+    """This creates a pending state where player must choose who to pay"""
+    other_players = [p for p in game.players if p != player and not p.is_bankrupt]
+    
+    if not other_players:
+        return f"{player.name} has no one to pay!"
+    
+    def handle_choice(chosen_player_name):
+        chosen_player = next((p for p in other_players if p.name == chosen_player_name), None)
+        if chosen_player:
+            if player.money < amount:
+                player.must_sell = True
+                return f"{player.name} cannot pay ${amount} to {chosen_player.name} (insufficient funds)"
+            player.money -= amount
+            chosen_player.money += amount
+            return f"{player.name} pays ${amount} to {chosen_player.name}"
+        return "Invalid choice"
+    
+    # Create pending action
+    pending_action = PendingAction(
+        action_type="choose_player_to_pay",
+        player=player,
+        description=f"Choose a player to pay ${amount} to:",
+        choices=[p.name for p in other_players],
+        callback=handle_choice,
+        data={"amount": amount}
+    )
+    
+    game.set_pending_action(pending_action)
+    return "PENDING_CHOICE"
 
 def _earn_money(game, player, amount: int):
     player.money += amount
@@ -96,6 +149,20 @@ def _collect_from_all_players(game, player, amount: int):
     
     return "; ".join(messages)
 
+def _downgrade_mover(game, player):
+    if player.mover_level > 0:
+        player.mover_level -= 1
+        return f"{player.name} downgrades their mover to level {player.mover_level}"
+    return f"{player.name}'s mover is already at the lowest level"
+
+def _upgrade_mover(game, player):
+    if player.mover_level < 2:
+        player.mover_level += 1
+        return f"{player.name} upgrades their mover to level {player.mover_level}"
+    else:
+        player.money += 50_000
+        return f"{player.name}'s mover is already at the highest level, receives $50,000 instead"
+
 def _go_to_jail(game, player):
     player.position = game.board.jail
     player.in_jail = True
@@ -126,7 +193,8 @@ def _use_jail_free_card(game, player):
 def make_decks():
     """ Create and shuffle the Chance and Millionaire decks """
     chance_deck = []
-    millionaire_deck = []
+    millionaire_deck = [Card("Go Straight to Jail. Do not pass Go. Do not collect your salary.", _go_to_jail, {}),
+                        Card("Start your own business. To make $150,000, roll: doubles, 8-12, 5-12", )]
 
     random.shuffle(chance_deck)
     random.shuffle(millionaire_deck)
@@ -211,22 +279,181 @@ class MillionaireMonopoly:
         self.players = [Player(name) for name in players]
         self.current_player_index = 0
         self.turns = 0
+
+        self.state = GameState.PLAYING
+        self.pending_action: Optional[PendingAction] = None
+        self.action_queue = []
+
         # dice state
         self.d1 = 0
         self.d2 = 0
         self.double_rolls = 0
         self.game_over = False
+
         start_pointer = self.board.head # self.board.find_position_by_name('Go') or 
         for player in self.players:
             player.position = start_pointer
 
         self.chance_deck, self.millionaire_deck = make_decks()
 
-    # quick fixup on this, poor code lol!
+    def set_pending_action(self, action: PendingAction):
+        """Set a pending action and change game state"""
+        self.pending_action = action
+        self.state = GameState.WAITING_FOR_CHOICE
+
+    def handle_pending_choice(self, choice: str) -> str:
+        """Handle a user's choice for a pending action"""
+        if not self.pending_action:
+            return "No pending action"
+        
+        if choice not in self.pending_action.choices:
+            return f"Invalid choice. Valid options: {', '.join(self.pending_action.choices)}"
+        
+        # Execute the callback
+        result = self.pending_action.callback(choice)
+        
+        # Clear pending state
+        self.pending_action = None
+        self.state = GameState.PLAYING
+        
+        return result
+    
+    def get_game_state(self) -> Dict[str, Any]:
+        """Get the current game state for the frontend"""
+        state = {
+            "game_state": self.state.value,
+            "current_player": self.players[self.current_player_index].name,
+            "turn": self.turns,
+            "dice": [self.d1, self.d2],
+            "players": [
+                {
+                    "name": p.name,
+                    "money": p.money,
+                    "position": p.position.data["Name"] if p.position else None,
+                    "properties": [prop.data["Name"] for prop in p.properties],
+                    "in_jail": p.in_jail,
+                    "mover_level": p.mover_level,
+                    "must_sell": p.must_sell
+                }
+                for p in self.players
+            ]
+        }
+        
+        if self.pending_action:
+            state["pending_action"] = {
+                "type": self.pending_action.action_type,
+                "player": self.pending_action.player.name,
+                "description": self.pending_action.description,
+                "choices": self.pending_action.choices,
+                "data": self.pending_action.data
+            }
+        
+        return state
+    
+    def can_make_move(self) -> bool:
+        """Check if the game can proceed with the next move"""
+        return self.state == GameState.PLAYING and not self.game_over
+    
+    def handle_property_landing(self, player, position):
+        """Handle when a player lands on a property - might create pending state"""
+        if position.owner and position.owner != player:
+            rent = self.calculate_rent(player, position)
+            if rent > 0:
+                if player.money < rent:
+                    # Create pending state for selling assets
+                    pending_action = PendingAction(
+                        action_type="must_pay_rent",
+                        player=player,
+                        description=f"You owe ${rent} to {position.owner.name} for {position.data['Name']}. You must sell assets or declare bankruptcy.",
+                        choices=["sell_assets", "declare_bankruptcy"],
+                        data={"rent": rent, "owner": position.owner.name}
+                    )
+                    self.set_pending_action(pending_action)
+                    return "PENDING_PAYMENT"
+                else:
+                    player.money -= rent
+                    position.owner.money += rent
+                    return f"{player.name} pays ${rent} rent to {position.owner.name}"
+        elif not position.owner and position.cost > 0:
+            # Create pending state for property purchase
+            pending_action = PendingAction(
+                action_type="property_purchase",
+                player=player,
+                description=f"Do you want to buy {position.data['Name']} for ${position.cost}?",
+                choices=["buy", "pass"],
+                data={"property": position, "cost": position.cost}
+            )
+            self.set_pending_action(pending_action)
+            return "PENDING_PROPERTY_DECISION"
+        
+        return None
+
     def roll_dice(self):
+        """Roll dice - only allowed if game can make a move"""
+        if not self.can_make_move():
+            return False
+        
         self.d1 = random.randint(1, 6)
         self.d2 = random.randint(1, 6)
-        return self.d1, self.d2
+        return True
+    
+    def move_player(self, steps=None, upgrade_mover=False):
+        """Move player and handle the resulting position"""
+        if not self.can_make_move():
+            return "Cannot move - game is in pending state"
+        
+        if steps is None:
+            steps = self.d1 + self.d2
+        
+        player = self.players[self.current_player_index]
+        
+        # Move the player
+        for _ in range(steps):
+            player.position = player.position.next
+            if player.position.data['Name'] == 'Go':
+                bonus = self.GO_BONUS[player.mover_level]
+                if upgrade_mover and player.mover_level < 2:
+                    player.mover_level += 1
+                    bonus -= 50_000 
+                player.money += bonus
+        
+        position_name = player.position.data['Name']
+        result = f"{player.name} moves to {position_name}"
+
+        # Handle special positions
+        if position_name == 'Go to Jail':
+            _go_to_jail(self, player)
+            result += " and goes to Jail!"
+        elif position_name == 'Chance':
+            if self.chance_deck:
+                card = self.chance_deck.popleft()
+                card_result = card.apply(self, player)
+                self.chance_deck.append(card)
+                if card_result != "PENDING_CHOICE":
+                    result += f" | Chance Card: {card.desc} -> {card_result}"
+                else:
+                    result += f" | Chance Card: {card.desc} (awaiting choice)"
+        elif position_name == 'Millionaire Lifestyle':
+            if self.millionaire_deck:
+                card = self.millionaire_deck.popleft()
+                card_result = card.apply(self, player)
+                self.millionaire_deck.append(card)
+                if card_result != "PENDING_CHOICE":
+                    result += f" | Millionaire Card: {card.desc} -> {card_result}"
+                else:
+                    result += f" | Millionaire Card: {card.desc} (awaiting choice)"
+        else:
+            # Handle property landing
+            landing_result = self.handle_property_landing(player, player.position)
+            if landing_result and not landing_result.startswith("PENDING"):
+                result += f" | {landing_result}"
+
+        # Only advance turn if no pending action
+        if self.state == GameState.PLAYING:
+            self.current_player_index = (self.current_player_index + 1) % len(self.players)
+            self.turns += 1
+
+        return result
     
     def buy_property(self, player, property):
         if property.owner is not None:
@@ -249,6 +476,13 @@ class MillionaireMonopoly:
         to_player.properties.append(property)
         property.owner = to_player
         return f"{from_player.name} transfers {property.data['Name']} to {to_player.name}."
+    
+    def send_money(self, from_player, to_player, amount):
+        if from_player.money < amount:
+            return f"{from_player.name} does not have enough money to pay ${amount} to {to_player.name}!"
+        from_player.money -= amount
+        to_player.money += amount
+        return f"{from_player.name} pays ${amount} to {to_player.name}."
     
     def buy_house(self, player, property, cost_per_house, num=1):
         if property.owner != player:
@@ -309,17 +543,39 @@ class MillionaireMonopoly:
                     bonus -= 50_000 
                 player.money += bonus
                 print(f"{player.name} passed Go and collects ${bonus}!")
+        
+        position_name = player.position.data['Name']
 
-        # calculate the effect of landing on the new position
-        cost = self.calculate_rent(player, player.position)
-        if cost > 0:
-            if player.money < cost:
-                player.must_sell = True
-                print(f"{player.name} cannot pay rent of ${cost} to {player.position.owner.name} (insufficient funds)")
+        if position_name == 'Go to Jail':
+            _go_to_jail(self, player)
+            print(f"{player.name} goes directly to Jail!")
+        elif position_name == 'Chance':
+            if self.chance_deck:
+                card = self.chance_deck.popleft()
+                result = card.apply(self, player)
+                print(f"Chance Card: {card.desc} -> {result}")
+                self.chance_deck.append(card)
             else:
-                player.money -= cost
-                player.position.owner.money += cost
-                print(f"{player.name} pays ${cost} rent to {player.position.owner.name} for landing on {player.position.data['Name']}")
+                print("Chance deck is empty!")
+        elif position_name == 'Millionaire Lifestyle':
+            if self.millionaire_deck:
+                card = self.millionaire_deck.popleft()
+                result = card.apply(self, player)
+                print(f"Millionaire Card: {card.desc} -> {result}")
+                self.millionaire_deck.append(card)
+            else:
+                print("Millionaire deck is empty!")
+        else:
+            # calculate the effect of landing on the new position
+            cost = self.calculate_rent(player, player.position)
+            if cost > 0:
+                if player.money < cost:
+                    player.must_sell = True
+                    print(f"{player.name} cannot pay rent of ${cost} to {player.position.owner.name} (insufficient funds)")
+                else:
+                    player.money -= cost
+                    player.position.owner.money += cost
+                    print(f"{player.name} pays ${cost} rent to {player.position.owner.name} for landing on {player.position.data['Name']}")
 
         self.current_player_index = (self.current_player_index + 1) % len(self.players)        
     
@@ -372,6 +628,7 @@ if __name__ == "__main__":
     for p in pink_props:
         game.buy_property(game.players[1], p)
 
+
     game.buy_house(game.players[0], brown_props[0], cost_per_house=10_000, num=3)  # Buy 1 house on Motor Drive
     print(game.calculate_rent(game.players[1], brown_props[0]))  # Should be 50k bc 3 houses
     print(game.calculate_rent(game.players[0], brown_props[0]))  # should be 0 
@@ -388,10 +645,11 @@ if __name__ == "__main__":
     
     # Simulate a few turns
     for turn in range(10):
-        d1, d2 = game.roll_dice()
-        steps = d1 + d2
-        print(f"Turn {turn + 1}: Dice rolled: {d1} + {d2} = {steps}")
-        game.move_player(steps)
+        game.roll_dice()
+
+        steps = game.d1 + game.d2
+        print(f"\nTurn {turn + 1}: Dice rolled: {game.d1} + {game.d2} = {steps}")
+        game.move_player(steps, upgrade_mover=True)
         print(f"{game.players[turn % len(game.players)].name} moved to: {game.players[turn % len(game.players)].position.data['Name']}")
 
     print("\nFinal Player States:")
